@@ -342,7 +342,7 @@ public class JsonComparator {
      */
     private static JsonToken skipChildren(JsonParser parser, JsonToken token) throws IOException {
         if (token == JsonToken.START_OBJECT || token == JsonToken.START_ARRAY) {
-            return parser.skipChildren();
+            return parser.skipChildren().nextToken();
         }
         return parser.nextToken();
     }
