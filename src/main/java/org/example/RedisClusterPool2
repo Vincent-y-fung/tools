@@ -1,0 +1,368 @@
+package org.example;
+
+import io.lettuce.core.RedisURI;
+import io.lettuce.core.TimeoutOptions;
+import io.lettuce.core.cluster.ClusterClientOptions;
+import io.lettuce.core.cluster.ClusterTopologyRefreshOptions;
+import io.lettuce.core.cluster.RedisClusterClient;
+import io.lettuce.core.cluster.api.StatefulRedisClusterConnection;
+import io.lettuce.core.resource.ClientResources;
+import io.lettuce.core.resource.DefaultClientResources;
+import io.lettuce.core.resource.NettyCustomizer;
+import io.netty.bootstrap.Bootstrap;
+import io.netty.channel.ChannelOption;
+import org.apache.commons.pool2.BasePooledObjectFactory;
+import org.apache.commons.pool2.PooledObject;
+import org.apache.commons.pool2.impl.DefaultPooledObject;
+import org.apache.commons.pool2.impl.GenericObjectPool;
+import org.apache.commons.pool2.impl.GenericObjectPoolConfig;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.time.Duration;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * 商用级 Redis Cluster 连接池（Lettuce 6.7.1 版本）
+ * 包含连接池优化、资源管理、监控日志及安全配置
+ *
+ * 特性：
+ * - 基于Lettuce的Redis集群客户端
+ * - 连接池参数可配置
+ * - 自动拓扑刷新和自适应重连
+ * - 连接有效性验证和空闲连接清理
+ * - 详细的连接池使用监控
+ * - 优雅的资源关闭和释放机制
+ */
+public class RedisClusterPool2 {
+    private static final Logger logger = LoggerFactory.getLogger(RedisClusterPool2.class);
+
+    // 连接池配置常量
+    private static final int MAX_TOTAL_CONNECTIONS = 5;        // 最大连接数（根据业务QPS调整）
+    private static final int MAX_IDLE_CONNECTIONS = 5;          // 最大空闲连接
+    private static final int MIN_IDLE_CONNECTIONS = 2;          // 最小空闲连接
+    private static final long MAX_WAIT_MILLIS = 2000;            // 获取连接超时(ms)
+    private static final long MIN_EVICTABLE_IDLE_TIME = 30 * 60 * 1000; // 最小空闲时间(ms)
+    private static final long SOFT_MIN_EVICTABLE_IDLE_TIME = 10 * 60 * 1000; // 软驱逐空闲时间(ms)
+    private static final long TIME_BETWEEN_EVICTION_RUNS = 5 * 60 * 1000; // 空闲检查间隔(ms)
+
+    // 新增：Redis命令执行超时配置
+    private static final long COMMAND_TIMEOUT_MILLIS = 5000;    // 命令执行超时(ms)
+
+    // 连接池实例（单例）
+    private static volatile RedisClusterPool2 instance;
+    // Lettuce 集群客户端
+    private final RedisClusterClient clusterClient;
+    // 连接池
+    private final GenericObjectPool<StatefulRedisClusterConnection<String, String>> connectionPool;
+    // 客户端资源
+    private final ClientResources clientResources;
+
+    /**
+     * 私有构造函数，初始化连接池
+     */
+    private RedisClusterPool2(List<String> clusterNodes, GenericObjectPoolConfig<StatefulRedisClusterConnection<String, String>> poolConfig) {
+        // 1. 初始化客户端资源配置
+        this.clientResources = buildClientResources();
+
+        // 2. 创建集群客户端
+        this.clusterClient = RedisClusterClient.create(
+                clientResources,
+                clusterNodes.stream().map(this::createConfiguredURI).toList()
+        );
+
+        // 3. 配置集群高可用参数
+        configureClusterClientOptions();
+
+        // 4. 初始化连接池
+        this.connectionPool = new GenericObjectPool<>(
+                new RedisClusterConnectionFactory(clusterClient),
+                poolConfig
+        );
+
+        // 注册JVM关闭钩子，确保资源优雅关闭
+        Runtime.getRuntime().addShutdownHook(new Thread(this::close));
+
+        logger.info("RedisClusterPool2 initialized with {} nodes, max total connections: {}",
+                clusterNodes.size(), poolConfig.getMaxTotal());
+    }
+
+    /**
+     * 构建客户端资源（线程池、网络配置等）
+     */
+    private ClientResources buildClientResources() {
+        return DefaultClientResources.builder()
+                // IO线程数：建议为CPU核心数 * 2
+                .ioThreadPoolSize(Runtime.getRuntime().availableProcessors() * 2)
+                // 计算线程数：建议为CPU核心数
+                .computationThreadPoolSize(Runtime.getRuntime().availableProcessors())
+                .nettyCustomizer(new NettyCustomizer() {
+                    @Override
+                    public void afterBootstrapInitialized(Bootstrap bootstrap) {
+                        bootstrap.option(ChannelOption.TCP_NODELAY, true); // 减少网络延迟
+                        bootstrap.option(ChannelOption.SO_RCVBUF, 1024 * 1024); // 接收缓冲区
+                        bootstrap.option(ChannelOption.SO_BACKLOG, 1024); // 连接队列长度
+                    }
+                })
+                .build();
+    }
+
+    /**
+     * 创建配置好的RedisURI（包含超时和安全配置）
+     */
+    private RedisURI createConfiguredURI(String node) {
+        RedisURI uri = RedisURI.create(node);
+        uri.setTimeout(Duration.ofSeconds(5));        // 连接超时
+
+        // 安全配置示例
+        // uri.setSsl(true);
+        // uri.setPassword("your-redis-password");
+        // uri.setTruststore("/path/to/truststore.jks");
+        // uri.setTruststorePassword("truststore-password");
+
+        return uri;
+    }
+
+    /**
+     * 配置集群客户端选项（高可用核心配置）
+     */
+    private void configureClusterClientOptions() {
+        // 拓扑刷新配置
+        ClusterTopologyRefreshOptions topologyRefreshOptions = ClusterTopologyRefreshOptions.builder()
+                .enablePeriodicRefresh(Duration.ofSeconds(30))         // 周期性刷新周期
+                .enableAdaptiveRefreshTrigger(
+                        ClusterTopologyRefreshOptions.RefreshTrigger.MOVED_REDIRECT,
+                        ClusterTopologyRefreshOptions.RefreshTrigger.PERSISTENT_RECONNECTS
+                )
+                .adaptiveRefreshTriggersTimeout(Duration.ofSeconds(5))  // 自适应刷新超时
+                .refreshPeriod(Duration.ofSeconds(60))                  // 拓扑刷新周期
+                .build();
+
+        // 集群客户端选项
+        ClusterClientOptions clientOptions = ClusterClientOptions.builder()
+                .topologyRefreshOptions(topologyRefreshOptions)
+                .autoReconnect(true)                                  // 自动重连
+                .maxRedirects(5)                                      // 最大重定向次数
+                .timeoutOptions(TimeoutOptions.builder()
+                        .fixedTimeout(Duration.ofMillis(COMMAND_TIMEOUT_MILLIS))
+                        .build())
+                .validateClusterNodeMembership(true)                  // 连接有效性验证
+                .build();
+
+        clusterClient.setOptions(clientOptions);
+    }
+
+    /**
+     * 获取单例实例
+     */
+    public static RedisClusterPool2 getInstance(List<String> clusterNodes) {
+        if (instance == null) {
+            synchronized (RedisClusterPool2.class) {
+                if (instance == null) {
+                    // 连接池配置
+                    GenericObjectPoolConfig<StatefulRedisClusterConnection<String, String>> poolConfig = new GenericObjectPoolConfig<>();
+                    poolConfig.setMaxTotal(MAX_TOTAL_CONNECTIONS);
+                    poolConfig.setMaxIdle(MAX_IDLE_CONNECTIONS);
+                    poolConfig.setMinIdle(MIN_IDLE_CONNECTIONS);
+                    poolConfig.setMaxWait(Duration.ofMillis(MAX_WAIT_MILLIS));
+                    poolConfig.setTestOnBorrow(true);         // 借用时检查连接
+                    poolConfig.setTestOnReturn(true);         // 归还时检查连接
+                    poolConfig.setTestWhileIdle(true);        // 空闲时检查连接
+                    poolConfig.setMinEvictableIdleTime(Duration.ofMillis(MIN_EVICTABLE_IDLE_TIME));
+                    poolConfig.setSoftMinEvictableIdleTime(Duration.ofMillis(SOFT_MIN_EVICTABLE_IDLE_TIME));
+                    poolConfig.setTimeBetweenEvictionRuns(Duration.ofMillis(TIME_BETWEEN_EVICTION_RUNS));
+                    poolConfig.setBlockWhenExhausted(true);   // 连接池耗尽时阻塞
+
+                    // 新增：连接池监控配置
+                    poolConfig.setJmxEnabled(true);
+                    poolConfig.setJmxNamePrefix("redisClusterPool");
+
+                    instance = new RedisClusterPool2(clusterNodes, poolConfig);
+                    logger.info("RedisClusterPool2 initialized with {} nodes", clusterNodes.size());
+                }
+            }
+        }
+        return instance;
+    }
+
+    /**
+     * 从连接池获取连接
+     * 使用try-with-resources模式确保连接自动归还
+     */
+    public StatefulRedisClusterConnection<String, String> borrowConnection() throws Exception {
+        try {
+            StatefulRedisClusterConnection<String, String> connection = connectionPool.borrowObject();
+            logPoolStats("Borrowed connection");
+            return connection;
+        } catch (Exception e) {
+            logger.error("Failed to borrow connection from pool. Pool stats: active={}, idle={}, waiting={}",
+                    connectionPool.getNumActive(), connectionPool.getNumIdle(), connectionPool.getNumWaiters(), e);
+            throw e;
+        }
+    }
+
+    /**
+     * 归还连接到池
+     * 优先使用try-with-resources模式，无需手动调用此方法
+     */
+    public void returnConnection(StatefulRedisClusterConnection<String, String> connection) {
+        if (connection == null) {
+            return;
+        }
+
+        try {
+            if (!connection.isOpen()) {
+                logger.warn("Returning closed connection to pool. Closing connection explicitly.");
+                connection.close();
+                return;
+            }
+
+            connectionPool.returnObject(connection);
+            logPoolStats("Returned connection");
+        } catch (Exception e) {
+            logger.error("Failed to return connection to pool. Pool stats: active={}, idle={}, waiting={}. Closing connection.",
+                    connectionPool.getNumActive(), connectionPool.getNumIdle(), connectionPool.getNumWaiters(), e);
+            try {
+                connection.close();
+            } catch (Exception ex) {
+                logger.error("Failed to close connection", ex);
+            }
+        }
+    }
+
+    /**
+     * 关闭连接池和客户端（应用退出时调用）
+     */
+    public void close() {
+        // 先关闭连接池
+        if (connectionPool != null && !connectionPool.isClosed()) {
+            logger.info("Closing Redis connection pool. Pool stats: active={}, idle={}",
+                    connectionPool.getNumActive(), connectionPool.getNumIdle());
+            connectionPool.close();
+        }
+
+        // 再关闭客户端
+        if (clusterClient != null) {
+            logger.info("Shutting down RedisClusterClient");
+            clusterClient.shutdown();
+        }
+
+        // 最后关闭客户端资源
+        if (clientResources != null) {
+            try {
+                clientResources.shutdown(100, 500, TimeUnit.MILLISECONDS).get();
+            } catch (Exception e) {
+                logger.error("Failed to shutdown client resources", e);
+            }
+        }
+
+        logger.info("RedisClusterPool2 closed successfully");
+    }
+
+    /**
+     * 记录连接池状态统计信息
+     */
+    private void logPoolStats(String action) {
+        if (logger.isDebugEnabled()) {
+            logger.debug("{} - Active: {}, Idle: {}, Waiters: {}, Borrowed: {}",
+                    action,
+                    connectionPool.getNumActive(),
+                    connectionPool.getNumIdle(),
+                    connectionPool.getNumWaiters(),
+                    connectionPool.getBorrowedCount());
+        }
+    }
+
+    /**
+     * 连接工厂类，用于创建和管理 Redis 连接
+     */
+    private static class RedisClusterConnectionFactory extends BasePooledObjectFactory<StatefulRedisClusterConnection<String, String>> {
+        private final RedisClusterClient client;
+
+        public RedisClusterConnectionFactory(RedisClusterClient client) {
+            this.client = client;
+        }
+
+        @Override
+        public StatefulRedisClusterConnection<String, String> create() {
+            logger.trace("Creating new Redis connection");
+            return client.connect();
+        }
+
+        @Override
+        public PooledObject<StatefulRedisClusterConnection<String, String>> wrap(StatefulRedisClusterConnection<String, String> connection) {
+            return new DefaultPooledObject<>(connection);
+        }
+
+        @Override
+        public void destroyObject(PooledObject<StatefulRedisClusterConnection<String, String>> p) {
+            try {
+                StatefulRedisClusterConnection<String, String> connection = p.getObject();
+                if (connection != null) {
+                    connection.close();
+                }
+            } catch (Exception e) {
+                logger.error("Failed to close Redis connection", e);
+            }
+        }
+
+        @Override
+        public boolean validateObject(PooledObject<StatefulRedisClusterConnection<String, String>> p) {
+            try {
+                StatefulRedisClusterConnection<String, String> connection = p.getObject();
+                if (connection == null || !connection.isOpen()) {
+                    return false;
+                }
+
+                // 执行轻量级命令验证连接有效性
+                String result = connection.sync().ping();
+                boolean valid = "PONG".equalsIgnoreCase(result);
+                if (!valid) {
+                    logger.warn("Connection validation failed, ping returned: {}", result);
+                }
+                return valid;
+            } catch (Exception e) {
+                logger.warn("Connection validation failed", e);
+                return false;
+            }
+        }
+    }
+
+    // ------------------------------ 测试示例 ------------------------------
+    public static void main(String[] args) {
+        // 1. 初始化连接池
+        List<String> clusterNodes = List.of(
+                "redis://192.168.1.10:6379",
+                "redis://192.168.1.11:6379",
+                "redis://192.168.1.12:6379"
+        );
+        RedisClusterPool2 pool = RedisClusterPool2.getInstance(clusterNodes);
+
+        // 2. 使用连接执行操作
+        try (StatefulRedisClusterConnection<String, String> connection = pool.borrowConnection()) {
+            var sync = connection.sync();
+
+            // 写入数据
+            sync.set("test:key", "value", Duration.ofMinutes(5));
+
+            // 读取数据
+            String value = sync.get("test:key");
+            System.out.println("获取值: " + value);
+
+            // 批量操作（Pipeline）
+            var async = connection.async();
+            var pipeline = async.pipelined();
+            pipeline.set("key1", "value1");
+            pipeline.set("key2", "value2");
+            pipeline.set("key3", "value3");
+            pipeline.exec().thenAccept(results -> System.out.println("批量操作完成"));
+
+        } catch (Exception e) {
+            logger.error("Redis operation failed", e);
+        } finally {
+            // 3. 应用退出时关闭连接池
+            pool.close();
+        }
+    }
+}
